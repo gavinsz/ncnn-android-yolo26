@@ -8,6 +8,7 @@ import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.util.Size;
@@ -24,6 +25,8 @@ import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
@@ -39,9 +42,28 @@ import java.util.concurrent.Executors;
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "Yolo26Ncnn";
     private static final int REQUEST_PERMISSION = 100;
-    private static final String[] REQUIRED_PERMISSIONS = {
-            Manifest.permission.CAMERA
-    };
+    private static final String[] REQUIRED_PERMISSIONS;
+
+    static {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // API 33+：相机 + 细粒度媒体权限
+            REQUIRED_PERMISSIONS = new String[]{
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.READ_MEDIA_IMAGES
+            };
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // API 23-32：相机 + 外部存储读取
+            REQUIRED_PERMISSIONS = new String[]{
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.READ_EXTERNAL_STORAGE
+            };
+        } else {
+            // API 21-22：权限在安装时自动授予，只列相机即可
+            REQUIRED_PERMISSIONS = new String[]{
+                    Manifest.permission.CAMERA
+            };
+        }
+    }
 
     private Yolo26Ncnn yolo26Ncnn = new Yolo26Ncnn();
     private PreviewView previewView;
@@ -194,15 +216,22 @@ public class MainActivity extends AppCompatActivity {
                         CameraSelector.LENS_FACING_BACK)
                 .build();
 
+        // 分辨率选择器（替代已废弃的 setTargetResolution）
+        ResolutionSelector resolutionSelector = new ResolutionSelector.Builder()
+                .setResolutionStrategy(new ResolutionStrategy(
+                        new Size(640, 480),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                .build();
+
         // 预览
         Preview preview = new Preview.Builder()
-                .setTargetResolution(new Size(640, 480))
+                .setResolutionSelector(resolutionSelector)
                 .build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
         // 图像分析
         ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
-                .setTargetResolution(new Size(640, 480))
+                .setResolutionSelector(resolutionSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build();
 
