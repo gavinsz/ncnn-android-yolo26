@@ -340,19 +340,27 @@ public class MainActivity extends AppCompatActivity {
 
             // 复制 Y 平面 (考虑 rowStride)
             int yPos = 0;
+            
+            // 先重置 buffer position
+            yBuffer.rewind();
+            
             if (yRowStride == width && yPixelStride == 1) {
                 // 快速路径：直接复制
-                yBuffer.get(nv21, 0, width * height);
-                yPos = width * height;
+                int bytesToRead = Math.min(yBuffer.remaining(), width * height);
+                for (int i = 0; i < bytesToRead && yPos < nv21.length; i++) {
+                    nv21[yPos++] = yBuffer.get();
+                }
             } else {
                 // 慢速路径：逐行复制
                 for (int row = 0; row < height; row++) {
-                    yBuffer.position(row * yRowStride);
+                    int rowStart = row * yRowStride;
                     for (int col = 0; col < width; col++) {
-                        nv21[yPos++] = yBuffer.get(row * yRowStride + col * yPixelStride);
+                        int idx = rowStart + col * yPixelStride;
+                        if (idx < yBuffer.capacity() && yPos < nv21.length) {
+                            nv21[yPos++] = yBuffer.get(idx);
+                        }
                     }
                 }
-                yBuffer.rewind();
             }
 
             // 复制 VU 交错平面
@@ -363,18 +371,21 @@ public class MainActivity extends AppCompatActivity {
 
             if (uvPixelStride == 2 && uvRowStride == width) {
                 // 快速路径：UV 已经是交错的 (常见情况)
-                // planes[2] (V) 已经是 VUVU... 格式
-                vBuffer.position(0);
+                vBuffer.rewind();
                 int uvSize = Math.min(vBuffer.remaining(), width * height / 2);
-                vBuffer.get(nv21, uvPos, uvSize);
+                
+                for (int i = 0; i < uvSize && uvPos < nv21.length; i++) {
+                    nv21[uvPos++] = vBuffer.get();
+                }
             } else if (uvPixelStride == 1) {
                 // 慢速路径：U 和 V 是分开的平面，需要手动交错
                 for (int row = 0; row < uvHeight; row++) {
                     for (int col = 0; col < uvWidth; col++) {
                         int uvIndex = row * uvRowStride + col * uvPixelStride;
-                        // NV21: V 先，U 后
-                        nv21[uvPos++] = vBuffer.get(uvIndex);  // V
-                        nv21[uvPos++] = uBuffer.get(uvIndex);  // U
+                        if (uvIndex < vBuffer.capacity() && uvIndex < uBuffer.capacity() && uvPos + 1 < nv21.length) {
+                            nv21[uvPos++] = vBuffer.get(uvIndex);  // V
+                            nv21[uvPos++] = uBuffer.get(uvIndex);  // U
+                        }
                     }
                 }
             } else {
@@ -382,8 +393,10 @@ public class MainActivity extends AppCompatActivity {
                 for (int row = 0; row < uvHeight; row++) {
                     for (int col = 0; col < uvWidth; col++) {
                         int uvIndex = row * uvRowStride + col * uvPixelStride;
-                        nv21[uvPos++] = vBuffer.get(uvIndex);  // V
-                        nv21[uvPos++] = uBuffer.get(uvIndex);  // U
+                        if (uvIndex < vBuffer.capacity() && uvIndex < uBuffer.capacity() && uvPos + 1 < nv21.length) {
+                            nv21[uvPos++] = vBuffer.get(uvIndex);  // V
+                            nv21[uvPos++] = uBuffer.get(uvIndex);  // U
+                        }
                     }
                 }
             }
@@ -423,6 +436,97 @@ public class MainActivity extends AppCompatActivity {
             return null;
         }
     }
+
+    /**
+     * 保存原始 YUV 数据到文件，用于分析格式
+     */
+    private void saveRawImageData(ImageProxy.PlaneProxy[] planes, int width, int height) {
+        // 使用 static 标志确保只保存一次
+        if (savedRawImage) return;
+        
+        try {
+            java.io.File dir = getExternalFilesDir(null);
+            if (dir == null) {
+                Log.e(TAG, "Cannot get external files directory");
+                return;
+            }
+            
+            // 保存各个平面的原始数据
+            for (int i = 0; i < 3; i++) {
+                String planeName = i == 0 ? "Y" : (i == 1 ? "U" : "V");
+                java.io.File file = new java.io.File(dir, "plane_" + planeName + "_" + width + "x" + height + ".raw");
+                
+                ByteBuffer buffer = planes[i].getBuffer();
+                int remaining = buffer.remaining();
+                byte[] data = new byte[remaining];
+                buffer.get(data, 0, remaining);
+                buffer.rewind();
+                
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(file);
+                fos.write(data);
+                fos.close();
+                
+                Log.d(TAG, String.format("Saved %s plane: %s (%d bytes)", 
+                        planeName, file.getAbsolutePath(), data.length));
+            }
+            
+            // 保存完整的 NV21 数据（转换后）
+            int nv21Size = width * height + (width * height / 2);
+            byte[] nv21 = new byte[nv21Size];
+            
+            // 简单复制 Y 平面
+            ByteBuffer yBuffer = planes[0].getBuffer();
+            int yRowStride = planes[0].getRowStride();
+            int yPixelStride = planes[0].getPixelStride();
+            
+            int yPos = 0;
+            if (yRowStride == width && yPixelStride == 1) {
+                yBuffer.get(nv21, 0, width * height);
+                yPos = width * height;
+            } else {
+                for (int row = 0; row < height; row++) {
+                    for (int col = 0; col < width; col++) {
+                        nv21[yPos++] = yBuffer.get(row * yRowStride + col * yPixelStride);
+                    }
+                }
+            }
+            
+            // 复制 UV 平面
+            ByteBuffer uBuffer = planes[1].getBuffer();
+            ByteBuffer vBuffer = planes[2].getBuffer();
+            int uvRowStride = planes[1].getRowStride();
+            int uvPixelStride = planes[1].getPixelStride();
+            int uvHeight = height / 2;
+            int uvWidth = width / 2;
+            int uvPos = width * height;
+            
+            for (int row = 0; row < uvHeight; row++) {
+                for (int col = 0; col < uvWidth; col++) {
+                    int uvIndex = row * uvRowStride + col * uvPixelStride;
+                    // 确保不超出缓冲区范围
+                    if (uvIndex < vBuffer.capacity() && uvIndex < uBuffer.capacity()) {
+                        nv21[uvPos++] = vBuffer.get(uvIndex);  // V
+                        nv21[uvPos++] = uBuffer.get(uvIndex);  // U
+                    }
+                }
+            }
+            
+            java.io.File nv21File = new java.io.File(dir, "nv21_" + width + "x" + height + ".raw");
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(nv21File);
+            fos.write(nv21);
+            fos.close();
+            
+            Log.d(TAG, "Saved NV21 data: " + nv21File.getAbsolutePath() + " (" + nv21Size + " bytes)");
+            Log.d(TAG, "=== Raw image data saved! Check the files for analysis ===");
+            
+            savedRawImage = true;
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save raw image data", e);
+        }
+    }
+    
+    private static boolean savedRawImage = false;
 
     @Override
     protected void onDestroy() {
