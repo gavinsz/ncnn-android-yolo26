@@ -1,11 +1,19 @@
 #ifndef YOLO_H
 #define YOLO_H
 
-#include <opencv2/core/core.hpp>
 #include <net.h>
 
+struct Rect {
+    float x;
+    float y;
+    float width;
+    float height;
+
+    float area() const { return width * height; }
+};
+
 struct Object {
-    cv::Rect_<float> rect;
+    Rect rect;
     int label;
     float prob;
 };
@@ -18,10 +26,9 @@ public:
     int load(const char* modeltype, int target_size, const float* mean_vals, const float* norm_vals, bool use_gpu = false);
     int load(AAssetManager* mgr, const char* modeltype, int target_size, const float* mean_vals, const float* norm_vals, bool use_gpu = false);
 
-    // default prob_threshold raised to cut noisy low-confidence boxes
-    int detect(const cv::Mat& rgb, std::vector<Object>& objects, float prob_threshold = 0.25f, float nms_threshold = 0.45f);
-
-    int draw(cv::Mat& rgb, const std::vector<Object>& objects);
+    // 输入: ncnn::Mat, pixel_type 传 ncnn::Mat::PIXEL_RGBA2BGR
+    // （camera 送来 RGBA，模型期望 BGR，直接在 ncnn 内部转换）
+    int detect(ncnn::Mat& in, std::vector<Object>& objects, float prob_threshold = 0.25f, float nms_threshold = 0.45f);
 
 private:
     ncnn::Net yolo;

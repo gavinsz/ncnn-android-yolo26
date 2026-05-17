@@ -11,9 +11,6 @@
 
 #include "yolo.h"
 
-#include <opencv2/core/core.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
-
 #if __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -87,10 +84,41 @@ JNIEXPORT jobjectArray JNICALL Java_com_example_yolo26ncnn_Yolo26Ncnn_detect(JNI
     void* indata;
     AndroidBitmap_lockPixels(env, bitmap, &indata);
 
-    // RGBA to BGR (model expects BGR input)
-    cv::Mat rgba(info.height, info.width, CV_8UC4, indata);
-    cv::Mat bgr;
-    cv::cvtColor(rgba, bgr, cv::COLOR_RGBA2BGR);
+    int width  = info.width;
+    int height = info.height;
+
+    // 使用 ncnn::Mat::from_pixels_resize 直接完成：
+    // RGBA→BGR 转换 + letterbox resize + padding
+    // 无需 OpenCV 的 cvtColor
+
+    // letterbox scale to 640x640
+    const int dst_size = YOLO26_TARGET_SIZE;
+    float scale = std::min(dst_size / (float)width, dst_size / (float)height);
+    int new_w = (int)std::round(width * scale);
+    int new_h = (int)std::round(height * scale);
+
+    int wpad = dst_size - new_w;
+    int hpad = dst_size - new_h;
+    int pad_left = wpad / 2;
+    int pad_top  = hpad / 2;
+
+    // RGBA → BGR + resize
+    ncnn::Mat in = ncnn::Mat::from_pixels_resize(
+            (unsigned char*)indata,
+            ncnn::Mat::PIXEL_RGBA2BGR,
+            width, height,
+            new_w, new_h
+    );
+
+    // padding 到 640x640
+    ncnn::Mat in_pad;
+    ncnn::copy_make_border(
+            in, in_pad,
+            pad_top, hpad - pad_top,
+            pad_left, wpad - pad_left,
+            ncnn::BORDER_CONSTANT,
+            114.f
+    );
 
     AndroidBitmap_unlockPixels(env, bitmap);
 
@@ -100,8 +128,26 @@ JNIEXPORT jobjectArray JNICALL Java_com_example_yolo26ncnn_Yolo26Ncnn_detect(JNI
         ncnn::MutexLockGuard g(lock);
 
         if (g_yolo) {
-            g_yolo->detect(bgr, objects);
+            g_yolo->detect(in_pad, objects);
         }
+    }
+
+    // 将检测结果坐标映射回原图尺寸（撤销 letterbox padding 和 scale）
+    for (size_t i = 0; i < objects.size(); i++) {
+        float x0 = (objects[i].rect.x - (float)pad_left) / scale;
+        float y0 = (objects[i].rect.y - (float)pad_top)  / scale;
+        float x1 = (objects[i].rect.x + objects[i].rect.width  - (float)pad_left) / scale;
+        float y1 = (objects[i].rect.y + objects[i].rect.height - (float)pad_top)  / scale;
+
+        x0 = std::max(std::min(x0, (float)(width  - 1)), 0.f);
+        y0 = std::max(std::min(y0, (float)(height - 1)), 0.f);
+        x1 = std::max(std::min(x1, (float)(width  - 1)), 0.f);
+        y1 = std::max(std::min(y1, (float)(height - 1)), 0.f);
+
+        objects[i].rect.x      = x0;
+        objects[i].rect.y      = y0;
+        objects[i].rect.width  = x1 - x0;
+        objects[i].rect.height = y1 - y0;
     }
 
     // Create result array
@@ -124,7 +170,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_example_yolo26ncnn_Yolo26Ncnn_detect(JNI
         env->SetFloatField(jObj, wId, objects[i].rect.width);
         env->SetFloatField(jObj, hId, objects[i].rect.height);
 
-        // 边界检查防止越界访问
         int label = objects[i].label;
         const char* label_name = (label >= 0 && label < 80) ? class_names[label] : "unknown";
         env->SetObjectField(jObj, labelId, env->NewStringUTF(label_name));

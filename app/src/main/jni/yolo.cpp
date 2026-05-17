@@ -5,9 +5,6 @@
 
 #include "yolo.h"
 
-#include <opencv2/core/core.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
-
 #include <cpu.h>
 #include <layer.h>
 
@@ -20,10 +17,15 @@
 #define TAG "YOLO26"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 
+// 计算两个矩形交集面积（替代 cv::Rect_<float> 的 & 操作）
 static inline float intersection_area(const Object& a, const Object& b)
 {
-    cv::Rect_<float> inter = a.rect & b.rect;
-    return inter.area();
+    float x1 = std::max(a.rect.x, b.rect.x);
+    float y1 = std::max(a.rect.y, b.rect.y);
+    float x2 = std::min(a.rect.x + a.rect.width,  b.rect.x + b.rect.width);
+    float y2 = std::min(a.rect.y + a.rect.height, b.rect.y + b.rect.height);
+    if (x2 < x1 || y2 < y1) return 0.f;
+    return (x2 - x1) * (y2 - y1);
 }
 
 static void qsort_descent_inplace(std::vector<Object>& objects, int left, int right)
@@ -163,25 +165,6 @@ static void generate_proposals_yolo26(const ncnn::Mat& pred,
     if (out_global_max) *out_global_max = global_max;
 }
 
-// helpers: detect cv::Mat channel format robustly
-static int pick_pixel_type_for_ncnn(const cv::Mat& img)
-{
-    // Ultralytics expects RGB
-    // OpenCV default is BGR for CV_8UC3
-    // Camera/Bitmap pipelines sometimes yield RGBA CV_8UC4
-    int type = img.type();
-    if (type == CV_8UC3) return ncnn::Mat::PIXEL_BGR2RGB;
-    if (type == CV_8UC4) return ncnn::Mat::PIXEL_RGBA2RGB;
-    // if user already provides RGB
-    if (type == CV_8UC1)
-    {
-        // not supported directly for YOLO; caller should convert to 3 channels
-        return -1;
-    }
-    // fallback: assume BGR
-    return ncnn::Mat::PIXEL_BGR2RGB;
-}
-
 Yolo::Yolo()
 {
     blob_pool_allocator.set_size_compare_ratio(0.f);
@@ -208,7 +191,6 @@ int Yolo::load(const char* modeltype, int _target_size, const float* _mean_vals,
     yolo.opt.use_vulkan_compute = use_gpu;
     if (use_gpu)
     {
-        // Force FP32 for better accuracy on GPU
         yolo.opt.use_fp16_packed = false;
         yolo.opt.use_fp16_storage = false;
         yolo.opt.use_fp16_arithmetic = false;
@@ -254,7 +236,6 @@ int Yolo::load(AAssetManager* mgr, const char* modeltype, int _target_size, cons
     yolo.opt.use_vulkan_compute = use_gpu;
     if (use_gpu)
     {
-        // Force FP32 for better accuracy on GPU
         yolo.opt.use_fp16_packed = false;
         yolo.opt.use_fp16_storage = false;
         yolo.opt.use_fp16_arithmetic = false;
@@ -285,54 +266,15 @@ int Yolo::load(AAssetManager* mgr, const char* modeltype, int _target_size, cons
     return 0;
 }
 
-int Yolo::detect(const cv::Mat& input, std::vector<Object>& objects, float prob_threshold, float nms_threshold)
+// detect: in 是已经完成 RGBA→BGR 转换 + letterbox resize + padding 的 ncnn::Mat
+int Yolo::detect(ncnn::Mat& in_pad, std::vector<Object>& objects, float prob_threshold, float nms_threshold)
 {
     objects.clear();
 
-    const int img_w = input.cols;
-    const int img_h = input.rows;
+    const int img_w = in_pad.w;
+    const int img_h = in_pad.h;
 
-    // Your model is fixed 640x640 (8400 points), so target_size MUST be 640
-    const int dst_size = target_size; // set to 640 in Java/C++ init
-
-    // letterbox scale to dst_size x dst_size
-    float scale = std::min(dst_size / (float)img_w, dst_size / (float)img_h);
-    int new_w = (int)std::round(img_w * scale);
-    int new_h = (int)std::round(img_h * scale);
-
-    int wpad = dst_size - new_w;
-    int hpad = dst_size - new_h;
-    int pad_left = wpad / 2;
-    int pad_top  = hpad / 2;
-
-    int pixel_type = pick_pixel_type_for_ncnn(input);
-    if (pixel_type < 0)
-    {
-        LOGD("Unsupported input cv::Mat type=%d (expect CV_8UC3 or CV_8UC4)", input.type());
-        return -1;
-    }
-
-    // Debug input
-    LOGD("input: w=%d h=%d type=%d (CV_8UC3=%d CV_8UC4=%d)",
-         img_w, img_h, input.type(), CV_8UC3, CV_8UC4);
-
-    ncnn::Mat in = ncnn::Mat::from_pixels_resize(
-            input.data,
-            pixel_type,
-            img_w, img_h,
-            new_w, new_h
-    );
-
-    ncnn::Mat in_pad;
-    ncnn::copy_make_border(
-            in, in_pad,
-            pad_top, hpad - pad_top,
-            pad_left, wpad - pad_left,
-            ncnn::BORDER_CONSTANT,
-            114.f
-    );
-
-    // FORCE Ultralytics default: /255
+    // 归一化
     const float mean_vals_ultra[3] = {0.f, 0.f, 0.f};
     const float norm_vals_ultra[3] = {1 / 255.f, 1 / 255.f, 1 / 255.f};
     in_pad.substract_mean_normalize(mean_vals_ultra, norm_vals_ultra);
@@ -375,73 +317,16 @@ int Yolo::detect(const cv::Mat& input, std::vector<Object>& objects, float prob_
     for (int i = 0; i < count; i++)
     {
         objects[i] = proposals[picked[i]];
-
-        // Map from padded 640x640 coords back to original image coords
-        float x0 = (objects[i].rect.x - (float)pad_left) / scale;
-        float y0 = (objects[i].rect.y - (float)pad_top) / scale;
-        float x1 = (objects[i].rect.x + objects[i].rect.width  - (float)pad_left) / scale;
-        float y1 = (objects[i].rect.y + objects[i].rect.height - (float)pad_top) / scale;
-
-        x0 = std::max(std::min(x0, (float)(img_w - 1)), 0.f);
-        y0 = std::max(std::min(y0, (float)(img_h - 1)), 0.f);
-        x1 = std::max(std::min(x1, (float)(img_w - 1)), 0.f);
-        y1 = std::max(std::min(y1, (float)(img_h - 1)), 0.f);
-
-        objects[i].rect.x = x0;
-        objects[i].rect.y = y0;
-        objects[i].rect.width  = x1 - x0;
-        objects[i].rect.height = y1 - y0;
     }
 
     // sort by area desc (optional)
-    struct
-    {
-        bool operator()(const Object& a, const Object& b) const
-        {
+    struct {
+        bool operator()(const Object& a, const Object& b) const {
             return a.rect.area() > b.rect.area();
         }
     } objects_area_greater;
 
     std::sort(objects.begin(), objects.end(), objects_area_greater);
-
-    return 0;
-}
-
-int Yolo::draw(cv::Mat& rgb, const std::vector<Object>& objects)
-{
-    static const cv::Scalar colors[] = {
-            cv::Scalar( 67,  54, 244), cv::Scalar( 30,  99, 233), cv::Scalar( 39, 176, 156),
-            cv::Scalar( 58, 183, 103), cv::Scalar( 81, 181,  63), cv::Scalar(150, 243,  33),
-            cv::Scalar(169, 244,   3), cv::Scalar(188, 212,   0), cv::Scalar(150, 136,   0),
-            cv::Scalar(175,  80,  76), cv::Scalar(195,  74, 139), cv::Scalar(220,  57, 205),
-            cv::Scalar(235,  59, 255), cv::Scalar(193,   7, 255), cv::Scalar(152,   0, 255),
-            cv::Scalar( 87,  34, 255), cv::Scalar( 85,  72, 121), cv::Scalar(158, 158, 158),
-            cv::Scalar(125, 139,  96)
-    };
-
-    for (size_t i = 0; i < objects.size(); i++)
-    {
-        const Object& obj = objects[i];
-        const cv::Scalar& color = colors[i % 19];
-
-        cv::rectangle(rgb, obj.rect, color, 2);
-
-        char text[256];
-        const char* label_name = (obj.label >= 0 && obj.label < 80) ? class_names[obj.label] : "unknown";
-        sprintf(text, "%s %.1f%%", label_name, obj.prob * 100);
-
-        int baseLine = 0;
-        cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-
-        int x = (int)obj.rect.x;
-        int y = (int)obj.rect.y - label_size.height - baseLine;
-        if (y < 0) y = 0;
-        if (x + label_size.width > rgb.cols) x = rgb.cols - label_size.width;
-
-        cv::rectangle(rgb, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)), color, -1);
-        cv::putText(rgb, text, cv::Point(x, y + label_size.height),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255));
-    }
 
     return 0;
 }
